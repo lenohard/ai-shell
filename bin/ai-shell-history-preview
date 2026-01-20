@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""
+Preview helper for ai-shell history entries (used by fzf --preview).
+
+Input: base64-encoded JSON line from ~/.config/ai-shell/history.jsonl
+Output: human-readable text to stdout.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import sys
+
+
+def _safe(s: object) -> str:
+    return "" if s is None else str(s)
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        return 0
+    b64 = sys.argv[1]
+    try:
+        raw = base64.b64decode(b64.encode("ascii")).decode("utf-8", errors="replace")
+        obj = json.loads(raw)
+    except Exception:
+        print("Invalid history entry")
+        return 0
+
+    typ = _safe(obj.get("type") or "unknown")
+    model = _safe(obj.get("model") or "")
+    req = _safe(obj.get("request") or "")
+    payload = obj.get("payload") or {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    print(f"TYPE:  {typ}")
+    if model:
+        print(f"MODEL: {model}")
+    if req.strip():
+        print("\nREQUEST:\n" + req)
+
+    if typ == "chat":
+        content = _safe(payload.get("content") or "")
+        if content.strip():
+            print("\nCHAT:\n" + content)
+        return 0
+
+    if typ == "shell":
+        cmds = payload.get("commands") or []
+        if isinstance(cmds, list) and cmds:
+            print("\nCOMMANDS:")
+            for item in cmds:
+                if not isinstance(item, dict):
+                    continue
+                cmd = _safe(item.get("cmd")).strip()
+                why = _safe(item.get("why")).strip()
+                if not cmd:
+                    continue
+                print(f"- {cmd}")
+                if why:
+                    print(f"  why: {why}")
+        return 0
+
+    if typ == "plan":
+        steps = payload.get("steps") or []
+        if isinstance(steps, list) and steps:
+            print("\nSTEPS:")
+            for i, step in enumerate(steps, 1):
+                if not isinstance(step, dict):
+                    continue
+                title = _safe(step.get("title")).strip()
+                cmd = _safe(step.get("cmd")).strip()
+                why = _safe(step.get("why")).strip()
+                label = f"{i}. {title}".strip()
+                print(label)
+                if cmd:
+                    print(f"   {cmd}")
+                if why:
+                    print(f"   why: {why}")
+        return 0
+
+    # Unknown type: print payload as JSON.
+    try:
+        print("\nPAYLOAD:\n" + json.dumps(payload, ensure_ascii=False, indent=2))
+    except Exception:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
