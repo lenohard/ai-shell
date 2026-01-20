@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+"""
+Minimal OpenAI-compatible chat client with streaming output.
+
+Designed for local use with a Bifrost/OpenAI-compatible gateway.
+Stateless by default: each invocation sends a single prompt.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+
+
+_SHELL_CMD_SYSTEM_PROMPT = """You are a macOS/zsh shell assistant.
+
+Task: if the user is asking how to do something in the shell, propose one or more shell commands.
+
+Output MUST be valid JSON (no markdown, no code fences) in this exact shape:
+{
+  "commands": [
+    {"why": "<short explanation>", "cmd": "<single-line shell command>"}
+  ]
+}
+
+Rules:
+- Provide 1-6 options. Prefer safe, non-destructive commands.
+- Commands must be single-line. No tabs. No leading "$ ".
+- Keep "why" <= 12 words.
+- If the task is ambiguous or risky, include a safe "dry-run"/inspection option first.
+- If the user is NOT asking for shell commands, still return JSON with a best-effort command that helps (e.g., print help, open docs, echo guidance).
+"""
+
+_AUTO_SYSTEM_PROMPT = """You are a macOS/zsh assistant embedded in a terminal.
+
+Decide whether the user wants:
+1) a runnable shell command (or a few alternatives), OR
+2) a normal chat response (explanation, discussion, etc.).
+
+Output MUST be valid JSON (no markdown, no code fences) in exactly one of these two shapes:
+
+If commands are appropriate:
+{
+  "type": "shell",
+  "commands": [
+    {"why": "<short explanation>", "cmd": "<single-line shell command>"}
+  ]
+}
+
+If a normal response is appropriate:
+{
+  "type": "chat",
+  "content": "<plain text response>"
+}
+
+Rules for type="shell":
+- Provide 1-6 options. Prefer safe, non-destructive commands.
+- Commands must be single-line. No tabs. No leading "$ ".
+- Keep "why" <= 12 words.
+- If the task is ambiguous or risky, include a safe inspection/dry-run option first.
+
+Rules for type="chat":
+- Keep it concise and practical for terminal use.
+"""
+
+
+def _context_block() -> str:
+    """Best-effort runtime context to make commands accurate."""
+    cwd = os.getcwd()
+    shell = os.environ.get("SHELL", "")
+    term = os.environ.get("TERM", "")
+    mac_ver = platform.mac_ver()[0] or ""
+    py_ver = platform.python_version()
+    machine = platform.machine()
+    system = platform.system()
+    # Keep it single-line-ish and stable for the model.
+    lines = [
+        f"os={system} macos={mac_ver} arch={machine}",
+        f"shell={shell} term={term}",
+        f"cwd={cwd}",
+        f"python={py_ver}",
+    ]
+    return "\n".join([ln for ln in lines if ln.strip()])
+
+
+def _normalize_base_url(base_url: str) -> str:
+    base_url = base_url.strip().rstrip("/")
+    # Avoid accidental /v1/v1 when callers already include /v1.
+    if base_url.endswith("/v1"):
+        return base_url
+    return base_url + "/v1"
+
+
+def _spinner(stop: threading.Event, started: threading.Event, model: str) -> None:
+    dots = ["", ".", "..", "..."]
+    i = 0
+    # Keep quiet if output isn't a TTY (e.g. piping to a file).
+    if not sys.stderr.isatty():
+        return
+    while not stop.is_set() and not started.is_set():
+        msg = f"\rFetching reply from [{model}] {dots[i % len(dots)]}"
+        # Pad so shorter frames overwrite previous longer frames.
+        sys.stderr.write(msg.ljust(100))
+        sys.stderr.flush()
+        i += 1
+        time.sleep(0.25)
+    # Clear spinner line.
+    if sys.stderr.isatty():
+        sys.stderr.write("\r" + (" " * 100) + "\r")
+        sys.stderr.flush()
+
+
+def _iter_sse_lines(resp) -> str:
+    # Read line-by-line; urllib returns bytes.
+    while True:
+        line = resp.readline()
+        if not line:
+            break
+        try:
+            yield line.decode("utf-8", errors="replace").rstrip("\r\n")
+        except Exception:
+            yield str(line)
+
+
+def _extract_content_from_choice(choice: dict) -> str:
+    """
+    Best-effort content extraction for stream + non-stream variants.
+
+    Some gateways ignore stream=true and return a normal JSON response, and some
+    stream shapes differ (e.g. `text` vs `delta.content`).
+    """
+    if not isinstance(choice, dict):
+        return ""
+    delta = choice.get("delta") or {}
+    if isinstance(delta, dict):
+        chunk = delta.get("content")
+        if chunk:
+            return str(chunk)
+        chunk = delta.get("text")
+        if chunk:
+            return str(chunk)
+    msg = choice.get("message") or {}
+    if isinstance(msg, dict):
+        chunk = msg.get("content")
+        if chunk:
+            return str(chunk)
+    chunk = choice.get("text")
+    if chunk:
+        return str(chunk)
+    return ""
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="ai-shell-llm")
+    p.add_argument(
+        "prompt",
+        nargs="?",
+        help="Prompt to send. If omitted, reads from stdin.",
+    )
+    p.add_argument(
+        "-m",
+        "--model",
+        default=os.environ.get("LLM_MODEL", "mify-gateway/deepseek-chat"),
+        help="Model name (default: env LLM_MODEL or mify-gateway/deepseek-chat).",
+    )
+    p.add_argument(
+        "--base-url",
+        default=os.environ.get("BIFROST_BASE_URL", "http://127.0.0.1:8080"),
+        help="OpenAI-compatible base URL (default: env BIFROST_BASE_URL or http://127.0.0.1:8080).",
+    )
+    p.add_argument(
+        "--api-key",
+        default=os.environ.get("BIFROST_API_KEY"),
+        help="API key (default: env BIFROST_API_KEY).",
+    )
+    p.add_argument(
+        "--temperature",
+        type=float,
+        default=0.8,
+        help="Sampling temperature (default: 0.8).",
+    )
+    p.add_argument(
+        "--shell-cmds",
+        action="store_true",
+        help="Return shell command suggestions as TSV: <cmd>\\t<why> per line.",
+    )
+    p.add_argument(
+        "--auto",
+        action="store_true",
+        help="Let the model choose shell commands vs chat (JSON to stdout).",
+    )
+    args = p.parse_args()
+
+    prompt = args.prompt
+    if prompt is None:
+        prompt = sys.stdin.read()
+    prompt = (prompt or "").strip()
+    if not prompt:
+        return 0
+
+    if not args.api_key:
+        sys.stderr.write(
+            "ai-shell-llm: missing API key. Set BIFROST_API_KEY or pass --api-key.\n"
+        )
+        return 2
+
+    base = _normalize_base_url(args.base_url)
+    url = base + "/chat/completions"
+
+    messages = [{"role": "user", "content": prompt}]
+    temperature = args.temperature
+    if args.shell_cmds or args.auto:
+        # Force a deterministic, parseable response.
+        sys_prompt = _SHELL_CMD_SYSTEM_PROMPT
+        env_var = "AI_SHELL_SHELL_SYSTEM_PROMPT"
+        if args.auto:
+            sys_prompt = _AUTO_SYSTEM_PROMPT
+            env_var = "AI_SHELL_AUTO_SYSTEM_PROMPT"
+        sys_prompt = os.environ.get(env_var, sys_prompt).rstrip() + "\n\nContext:\n" + _context_block()
+        messages = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": prompt},
+        ]
+        temperature = 0.2
+
+    payload = {
+        "model": args.model,
+        "messages": messages,
+        "temperature": temperature,
+        # Always request streaming on the wire. For callers that want a full
+        # response (--auto/--shell-cmds), we still buffer client-side
+        # and print once complete.
+        "stream": True,
+        # Send both singular and plural to cover different gateway quirks/versions.
+        "stream_options": {"include_usage": True},
+        "stream_option": {"include_usage": True},
+    }
+
+    req = urllib.request.Request(
+        url=url,
+        method="POST",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "content-type": "application/json",
+            "authorization": f"Bearer {args.api_key}",
+            "User-Agent": "ai-shell-llm/0.1",
+        },
+    )
+
+    stop = threading.Event()
+    started = threading.Event()
+    t = threading.Thread(target=_spinner, args=(stop, started, args.model), daemon=True)
+    t.start()
+
+    printed_any = False
+    spinner_joined = False
+    buffered: list[str] = []
+    raw_non_sse_lines: list[str] = []
+    saw_sse = False
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            # If the caller asked for non-streaming output, we still use SSE but
+            # buffer chunks and print at the end.
+            want_live_stream = not (args.shell_cmds or args.auto)
+
+            for line in _iter_sse_lines(resp):
+                if not line.startswith("data: "):
+                    # Some gateways ignore stream=true; capture body for fallback.
+                    if line.strip():
+                        raw_non_sse_lines.append(line)
+                    continue
+                saw_sse = True
+                data = line[6:]
+                if data == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                choices = obj.get("choices") or []
+                if not choices:
+                    continue
+                chunk = _extract_content_from_choice(choices[0] or {})
+                if not chunk:
+                    continue
+                if not started.is_set():
+                    started.set()
+                # Ensure the spinner has fully stopped/cleared before we write any
+                # content, otherwise the spinner "clear line" can erase streamed output.
+                if not spinner_joined:
+                    t.join(timeout=1.0)
+                    spinner_joined = True
+
+                if want_live_stream:
+                    sys.stdout.write(chunk)
+                    sys.stdout.flush()
+                    printed_any = True
+                else:
+                    buffered.append(chunk)
+
+            # Fallback: server didn't stream SSE even though we asked.
+            if not saw_sse and raw_non_sse_lines:
+                stop.set()
+                started.set()
+                t.join(timeout=1.0)
+
+                raw = "\n".join(raw_non_sse_lines).strip()
+                try:
+                    obj = json.loads(raw)
+                except json.JSONDecodeError:
+                    if raw:
+                        sys.stdout.write(raw + ("\n" if sys.stdout.isatty() else ""))
+                    return 0
+
+                choices = obj.get("choices") or []
+                choice0 = choices[0] if choices else {}
+                content = _extract_content_from_choice(choice0).strip()
+
+                if args.shell_cmds:
+                    try:
+                        parsed = json.loads(content) if content else {}
+                    except json.JSONDecodeError:
+                        parsed = {}
+                    cmds = parsed.get("commands") or []
+                    for item in cmds:
+                        cmd = str((item or {}).get("cmd") or "").replace("\t", " ").strip()
+                        why = str((item or {}).get("why") or "").replace("\t", " ").strip()
+                        if cmd:
+                            sys.stdout.write(f"{cmd}\t{why}\n")
+                    return 0
+
+                if content:
+                    sys.stdout.write(content + "\n")
+                return 0
+
+            if not want_live_stream:
+                content = "".join(buffered).strip()
+                if args.shell_cmds:
+                    # Expect JSON content and print TSV for easy piping into fzf.
+                    try:
+                        parsed = json.loads(content) if content else {}
+                    except json.JSONDecodeError:
+                        parsed = {}
+                    cmds = parsed.get("commands") or []
+                    for item in cmds:
+                        cmd = str((item or {}).get("cmd") or "").replace("\t", " ").strip()
+                        why = str((item or {}).get("why") or "").replace("\t", " ").strip()
+                        if not cmd:
+                            continue
+                        sys.stdout.write(f"{cmd}\t{why}\n")
+                    return 0
+
+                # In --auto mode we expect JSON. We still print whatever we got
+                # so the caller can handle it.
+                if content:
+                    sys.stdout.write(content + "\n")
+                return 0
+    except urllib.error.HTTPError as e:
+        stop.set()
+        # Wait for spinner to clear
+        t.join(timeout=1.0)
+        
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        sys.stderr.write(f"ai-shell-llm: HTTP {e.code} {e.reason}\n")
+        if body:
+            sys.stderr.write(body + "\n")
+        return 1
+    except Exception as e:
+        stop.set()
+        t.join(timeout=1.0)
+        sys.stderr.write(f"ai-shell-llm: error: {e}\n")
+        return 1
+    finally:
+        stop.set()
+        started.set()
+
+    # Keep output tidy when streaming didn't include a trailing newline.
+    if printed_any and sys.stdout.isatty():
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
