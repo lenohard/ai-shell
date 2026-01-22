@@ -763,25 +763,25 @@ PY
       return 1
     fi
     local selected
-    selected="$(
-      print -r -- "${rest}" | fzf \
-        --ansi \
-        --delimiter=$'\t' \
-        --multi \
-        --with-nth=1 \
-        --preview='printf "\033[1mSTEP:\033[0m\n%s\n\n\033[1mCMD:\033[0m\n%s\n\n\033[1mWHY:\033[0m\n%s\n" {1} {2} {3}' \
-        --preview-window=down:wrap \
-        --prompt='step> ' \
-        --height=40% \
-        --layout=reverse 2> /dev/tty
-    )"
+	    selected="$(
+	      print -r -- "${rest}" | fzf \
+	        --ansi \
+	        --delimiter=$'\t' \
+	        --multi \
+	        --with-nth=1 \
+	        --preview='printf "\033[1mCMD:\033[0m\n%s\n\n\033[1mWHY:\033[0m\n%s\n\n\033[1mSTEP:\033[0m\n%s\n" {2} {3} {1}' \
+	        --preview-window=down:wrap \
+	        --prompt='step> ' \
+	        --height=40% \
+	        --layout=reverse 2> /dev/tty
+	    )"
     if [[ -z "${selected}" ]]; then
       print -r -- "ai-shell: cancelled" > /dev/tty
       return 0
     fi
-    # Convert "title<TAB>cmd<TAB>why" -> "cmd<TAB>why" for injection.
-    local converted
-    converted="$(print -r -- "${selected}" | python3 - <<'PY'
+	    # Convert "title<TAB>cmd<TAB>why" -> "cmd<TAB>why" for injection.
+	    local converted
+	    converted="$(print -r -- "${selected}" | python3 -c '
 import sys
 out = []
 for ln in sys.stdin.read().splitlines():
@@ -795,11 +795,10 @@ for ln in sys.stdin.read().splitlines():
     elif len(parts) == 1 and parts[0].strip():
         out.append(parts[0].strip() + "\t")
 sys.stdout.write("\n".join(out))
-PY
-)"
-    _ai_shell_inject_block "${request}" "${cmd_comment}" "${auto_copy}" "${converted}"
-    return 0
-  fi
+')"
+	    _ai_shell_inject_block "${request}" "${cmd_comment}" "${auto_copy}" "${converted}"
+	    return 0
+	  fi
 
   if [[ "${auto_copy}" == "1" ]] && command -v pbcopy >/dev/null 2>&1; then
     # Copy chat output as the "result" when not returning a shell command.
@@ -966,13 +965,12 @@ for step in (p.get("steps") or []):
         sys.stdout.write(f"{title}\t{cmd}\t{why}\n")
 PY
 )"
-    local selected_steps
-    selected_steps="$(print -r -- "${rest}" | fzf --ansi --delimiter=$'\t' --multi --with-nth=1 --preview='printf "\033[1mSTEP:\033[0m\n%s\n\n\033[1mCMD:\033[0m\n%s\n\n\033[1mWHY:\033[0m\n%s\n" {1} {2} {3}' --preview-window=down:wrap --prompt='step> ' --height=40% --layout=reverse 2> /dev/tty)"
-    [[ -z "${selected_steps}" ]] && return 0
-    local converted
-    converted="$(print -r -- "${selected_steps}" | python3 - <<'PY'
+	    local selected_steps
+	    selected_steps="$(print -r -- "${rest}" | fzf --ansi --delimiter=$'\t' --multi --with-nth=1 --preview='printf "\033[1mCMD:\033[0m\n%s\n\n\033[1mWHY:\033[0m\n%s\n\n\033[1mSTEP:\033[0m\n%s\n" {2} {3} {1}' --preview-window=down:wrap --prompt='step> ' --height=40% --layout=reverse 2> /dev/tty)"
+	    [[ -z "${selected_steps}" ]] && return 0
+	    local converted
+	    converted="$(print -r -- "${selected_steps}" | python3 -c '
 import sys
-
 out = []
 for ln in sys.stdin.read().splitlines():
     parts = ln.split("\t")
@@ -985,12 +983,11 @@ for ln in sys.stdin.read().splitlines():
     elif len(parts) == 1 and parts[0].strip():
         out.append(parts[0].strip() + "\t")
 sys.stdout.write("\n".join(out))
-PY
-)"
-    request="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("request",""))' "${payload_json}" 2>/dev/null)"
-    AI_SHELL_FORCE_ZLE_INJECT=1
-    _ai_shell_inject_block "${request}" "${cmd_comment}" "${auto_copy}" "${converted}"
-    AI_SHELL_FORCE_ZLE_INJECT=0
+')"
+	    request="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("request",""))' "${payload_json}" 2>/dev/null)"
+	    AI_SHELL_FORCE_ZLE_INJECT=1
+	    _ai_shell_inject_block "${request}" "${cmd_comment}" "${auto_copy}" "${converted}"
+	    AI_SHELL_FORCE_ZLE_INJECT=0
     return 0
   fi
 
