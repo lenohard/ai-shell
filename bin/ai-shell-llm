@@ -113,6 +113,53 @@ def _normalize_base_url(base_url: str) -> str:
     return base_url + "/v1"
 
 
+def _load_config() -> dict:
+    """Read runtime config from ~/.config/ai-shell/config.yaml.
+    Returns a flat dict of dotted keys (e.g. {"runtime.base_url": ...}).
+    """
+    result: dict = {}
+    path = os.path.join(
+        os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+        "ai-shell",
+        "config.yaml",
+    )
+    try:
+        with open(path) as f:
+            stack: list[tuple[int, str]] = []
+            for line in f:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                if ":" not in stripped:
+                    continue
+                indent = len(line) - len(line.lstrip())
+                k, v = stripped.split(":", 1)
+                k = k.strip()
+                v = v.strip()
+                if v and not (v.startswith("'") or v.startswith('"')) and " #" in v:
+                    v = v.split(" #", 1)[0].rstrip()
+                if (len(v) >= 2) and ((v[0] == v[-1] == "'") or (v[0] == v[-1] == '"')):
+                    v = v[1:-1]
+                while stack and stack[-1][0] >= indent:
+                    stack.pop()
+                if v == "":
+                    stack.append((indent, k))
+                    continue
+                prefix = ".".join([kk for _, kk in stack])
+                full = f"{prefix}.{k}" if prefix else k
+                result[full] = v
+    except Exception:
+        pass
+    return result
+
+
+def _resolve_config_value(config: dict, key: str) -> str:
+    """Resolve a config value, expanding $ENV_VAR references."""
+    v = config.get(key, "")
+    if v.startswith("$"):
+        return os.environ.get(v[1:], "")
+    return v
+
 def _spinner(stop: threading.Event, started: threading.Event, model: str) -> None:
     dots = ["", ".", "..", "..."]
     i = 0
@@ -232,15 +279,25 @@ def main() -> int:
         default=os.environ.get("LLM_MODEL", "mify-gateway/deepseek-chat"),
         help="Model name (default: env LLM_MODEL or mify-gateway/deepseek-chat).",
     )
+    _config = _load_config()
+    _default_base_url = (
+        _resolve_config_value(_config, "runtime.base_url")
+        or os.environ.get("AI_GATEWAY_BASE_URL")
+        or "https://mify-gateway.blankapp.org/v1"
+    )
+    _default_api_key = _resolve_config_value(
+        _config, "runtime.api_key"
+    ) or os.environ.get("AI_GATEWAY_API_KEY")
+
     p.add_argument(
         "--base-url",
-        default=os.environ.get("AI_GATEWAY_BASE_URL", "https://ai-gateway.vercel.sh"),
-        help="OpenAI-compatible base URL (default: env AI_GATEWAY_BASE_URL or https://ai-gateway.vercel.sh).",
+        default=_default_base_url,
+        help="OpenAI-compatible base URL (default: config.yaml runtime.base_url, env AI_GATEWAY_BASE_URL, or built-in).",
     )
     p.add_argument(
         "--api-key",
-        default=os.environ.get("AI_GATEWAY_API_KEY"),
-        help="API key (default: env AI_GATEWAY_API_KEY).",
+        default=_default_api_key,
+        help="API key (default: config.yaml runtime.api_key, env AI_GATEWAY_API_KEY, or built-in).",
     )
     p.add_argument(
         "--temperature",
