@@ -172,6 +172,53 @@ def _extract_content_from_choice(choice: dict) -> str:
     return ""
 
 
+# Models that use the OpenAI Responses API (not chat/completions)
+_RESPONSES_MODELS = frozenset({
+    "muse-spark-1.2-contributor",
+    "gpt-5.6-luna",
+})
+
+
+def _is_responses_model(model: str) -> bool:
+    """Check if the model uses the Responses API protocol."""
+    model_id = model.split("/")[-1] if "/" in model else model
+    return model_id in _RESPONSES_MODELS
+
+
+def _build_responses_payload(model: str, messages: list, temperature: float) -> dict:
+    """Build a payload for the OpenAI Responses API (/v1/responses)."""
+    instructions = None
+    user_input = ""
+    for msg in messages:
+        if msg["role"] == "system":
+            instructions = msg["content"]
+        elif msg["role"] == "user":
+            user_input = msg.get("content", "")
+    payload: dict = {
+        "model": model,
+        "input": user_input or "Hello",
+        "max_output_tokens": 4096,
+        "temperature": temperature,
+        "stream": True,
+    }
+    if instructions:
+        payload["instructions"] = instructions
+    return payload
+
+
+def _extract_responses_text(obj: dict) -> str:
+    """Extract text from a non-streaming Responses API response."""
+    output = obj.get("output") or []
+    for item in output:
+        if item.get("type") == "message":
+            for block in item.get("content") or []:
+                if block.get("type") == "output_text":
+                    text = block.get("text", "")
+                    if text:
+                        return text
+    return ""
+
+
 def main() -> int:
     p = argparse.ArgumentParser(prog="ai-shell-llm")
     p.add_argument(
@@ -187,13 +234,13 @@ def main() -> int:
     )
     p.add_argument(
         "--base-url",
-        default=os.environ.get("BIFROST_BASE_URL", "http://127.0.0.1:8080"),
-        help="OpenAI-compatible base URL (default: env BIFROST_BASE_URL or http://127.0.0.1:8080).",
+        default=os.environ.get("AI_GATEWAY_BASE_URL", "https://ai-gateway.vercel.sh"),
+        help="OpenAI-compatible base URL (default: env AI_GATEWAY_BASE_URL or https://ai-gateway.vercel.sh).",
     )
     p.add_argument(
         "--api-key",
-        default=os.environ.get("BIFROST_API_KEY"),
-        help="API key (default: env BIFROST_API_KEY).",
+        default=os.environ.get("AI_GATEWAY_API_KEY"),
+        help="API key (default: env AI_GATEWAY_API_KEY).",
     )
     p.add_argument(
         "--temperature",
@@ -222,12 +269,13 @@ def main() -> int:
 
     if not args.api_key:
         sys.stderr.write(
-            "ai-shell-llm: missing API key. Set BIFROST_API_KEY or pass --api-key.\n"
+            "ai-shell-llm: missing API key. Set AI_GATEWAY_API_KEY or pass --api-key.\n"
         )
         return 2
 
     base = _normalize_base_url(args.base_url)
-    url = base + "/chat/completions"
+    is_resp = _is_responses_model(args.model)
+    url = base + ("/responses" if is_resp else "/chat/completions")
 
     messages = [{"role": "user", "content": prompt}]
     temperature = args.temperature
@@ -245,18 +293,21 @@ def main() -> int:
         ]
         temperature = 0.2
 
-    payload = {
-        "model": args.model,
-        "messages": messages,
-        "temperature": temperature,
-        # Always request streaming on the wire. For callers that want a full
-        # response (--auto/--shell-cmds), we still buffer client-side
-        # and print once complete.
-        "stream": True,
-        # Send both singular and plural to cover different gateway quirks/versions.
-        "stream_options": {"include_usage": True},
-        "stream_option": {"include_usage": True},
-    }
+    if is_resp:
+        payload = _build_responses_payload(args.model, messages, temperature)
+    else:
+        payload = {
+            "model": args.model,
+            "messages": messages,
+            "temperature": temperature,
+            # Always request streaming on the wire. For callers that want a full
+            # response (--auto/--shell-cmds), we still buffer client-side
+            # and print once complete.
+            "stream": True,
+            # Send both singular and plural to cover different gateway quirks/versions.
+            "stream_options": {"include_usage": True},
+            "stream_option": {"include_usage": True},
+        }
 
     req = urllib.request.Request(
         url=url,
@@ -299,10 +350,17 @@ def main() -> int:
                     obj = json.loads(data)
                 except json.JSONDecodeError:
                     continue
-                choices = obj.get("choices") or []
-                if not choices:
-                    continue
-                chunk = _extract_content_from_choice(choices[0] or {})
+                if is_resp:
+                    evt_type = obj.get("type", "")
+                    if evt_type == "response.output_text.delta":
+                        chunk = obj.get("delta", "")
+                    else:
+                        continue
+                else:
+                    choices = obj.get("choices") or []
+                    if not choices:
+                        continue
+                    chunk = _extract_content_from_choice(choices[0] or {})
                 if not chunk:
                     continue
                 if not started.is_set():
@@ -334,9 +392,12 @@ def main() -> int:
                         sys.stdout.write(raw + ("\n" if sys.stdout.isatty() else ""))
                     return 0
 
-                choices = obj.get("choices") or []
-                choice0 = choices[0] if choices else {}
-                content = _extract_content_from_choice(choice0).strip()
+                if is_resp:
+                    content = _extract_responses_text(obj).strip()
+                else:
+                    choices = obj.get("choices") or []
+                    choice0 = choices[0] if choices else {}
+                    content = _extract_content_from_choice(choice0).strip()
 
                 if args.shell_cmds:
                     try:
