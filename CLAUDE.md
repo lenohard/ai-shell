@@ -72,8 +72,8 @@ runtime:
   # history_file: ~/.config/ai-shell/history.jsonl
   model_alias:
     mimo: xiaomi/mimo-v2-flash
-    gemini-3-flash: ai-gateway/google/gemini-3-flash-preview
-    deepseek: mify-gateway/volcengine_maas/deepseek-v3-2-251201
+    gemini-3-flash: google/gemini-3-flash
+    deepseek: deepseek/deepseek-v3.2
 ```
 
 ## Files / Scripts
